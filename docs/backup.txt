@@ -102,3 +102,20 @@ Firestore Rules (security boundary summary)
     C[/public/synonymPacks/{packId}/] -->|read| R
     D[/public/domainStats/{domain}/] -->|read| R
     R -->|allow/deny| FS[(Firestore)]
+
+
+
+    Final idea:
+
+    Safari Extension 
+   ↓ signIn
+Firebase Auth 
+   ↓ with UID
+Firestore 
+   ↑ encrypted writes (backup)
+   ↓ encrypted reads (restore)
+   → events for telemetry
+Cloud Functions 
+   → aggregates telemetry
+Public Packs 
+   ← read-only label hints
