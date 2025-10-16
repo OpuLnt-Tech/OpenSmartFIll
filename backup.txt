@@ -1,0 +1,104 @@
+Auth + Backup (encrypt client-side → Firestore)
+
+
+sequenceDiagram
+    autonumber
+    actor User
+    participant Ext as Safari Extension (Client)
+    participant Auth as Firebase Auth
+    participant FS as Firestore (/users/{uid}/vault)
+    participant Rules as Firestore Rules
+    note over Ext: Local: IndexedDB (fields), PBKDF2/Argon2 key, AES-GCM
+
+    User->>Ext: Open options → "Backup"
+    Ext->>Auth: signInAnonymously() (or Google/Apple)
+    Auth-->>Ext: uid + ID token
+    note right of Ext: Store uid; never store passphrase server-side
+
+    Ext->>Ext: Derive key (PBKDF2/Argon2id) from passphrase + local salt
+    loop For each local field record
+        Ext->>Ext: payload = {canonical,value,aliases,vectors?,meta}
+        Ext->>Ext: AES-GCM encrypt(payload) → {ciphertext, iv}
+        Ext->>FS: write /users/{uid}/vault/{docId}\n{ciphertext, iv, version, profile, updatedAt}
+        FS->>Rules: validate uid scope + schema + size
+        Rules-->>FS: allow write
+        FS-->>Ext: write ACK (or retry with backoff)
+    end
+    note over Ext,FS: No plaintext PII ever leaves the client
+
+
+
+Restore (Firestore → decrypt on client → IndexedDB)
+
+
+    sequenceDiagram
+    autonumber
+    actor User
+    participant Ext as Safari Extension (Client)
+    participant Auth as Firebase Auth
+    participant FS as Firestore (/users/{uid}/vault)
+    participant Rules as Firestore Rules
+    note over Ext: Local: IndexedDB (merge LWW by updatedAt)
+
+    User->>Ext: Click "Restore"
+    Ext->>Auth: ensureSignedIn() → uid
+    Auth-->>Ext: uid confirmed
+    Ext->>FS: query /users/{uid}/vault/*
+    FS->>Rules: validate uid read
+    Rules-->>FS: allow read
+    FS-->>Ext: stream encrypted docs (ciphertext, iv, profile, version, updatedAt)
+
+    loop For each encrypted doc
+        Ext->>Ext: AES-GCM decrypt(ciphertext, iv) with derived key
+        alt decrypt OK
+            Ext->>Ext: upsert into IndexedDB (if newer by updatedAt)
+        else bad passphrase/IV
+            Ext-->>User: Decrypt error → keep local data intact
+        end
+    end
+    Ext-->>User: Restore complete
+
+
+
+Telemetry (write-only, non-PII) & Public Packs (read-only)
+
+
+    sequenceDiagram
+    autonumber
+    participant Ext as Safari Extension (Client)
+    participant FS as Firestore
+    participant Rules as Firestore Rules
+    participant CF as Cloud Functions (Node 18)
+    participant Pub as Firestore (/public/*)
+
+    rect rgb(248,248,255)
+    note over Ext: Telemetry buffer (in-memory/IndexedDB)
+    Ext->>FS: create /users/{uid}/events/{eventId}\n{ts,type,label_hash,site_domain,profile,conf_bucket}
+    FS->>Rules: validate create-only, size cap
+    Rules-->>FS: allow create
+    end
+
+    rect rgb(245,255,248)
+    note over CF: Scheduled daily/Hourly
+    CF->>FS: read collectionGroup(/events) recent window
+    FS-->>CF: non-PII event docs
+    CF->>Pub: write /public/domainStats/{domain}\n{correctionRate,sample,updatedAt}
+    end
+
+    rect rgb(245,248,255)
+    note over Ext: Read-only public hints
+    Ext->>Pub: read /public/synonymPacks/{packId}
+    Pub-->>Ext: {canonical, variants[], domainHints[], version}
+    end
+
+
+
+Firestore Rules (security boundary summary)
+
+
+    flowchart TD
+    A[/users/{uid}/vault/{docId}/] -->|read/write| R[Rules: signed-in AND uid match<br/>AND fields present AND size < 64KB]
+    B[/users/{uid}/events/{eventId}/] -->|create-only| R
+    C[/public/synonymPacks/{packId}/] -->|read| R
+    D[/public/domainStats/{domain}/] -->|read| R
+    R -->|allow/deny| FS[(Firestore)]
